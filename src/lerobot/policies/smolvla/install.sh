@@ -3,7 +3,7 @@ set -euo pipefail
 
 # ===== Config =====
 ENV_NAME="smol"
-REPO_DIR="$HOME/VPR_model_tests/dino/lerobot_smolVLA"
+REPO_DIR="/home/saurav/dl_project/lerobot_smolVLA"
 
 # If you want a fully fresh env every time, uncomment:
 # conda env remove -n "${ENV_NAME}" -y || true
@@ -19,7 +19,7 @@ conda run -n "${ENV_NAME}" python -m pip install --upgrade pip setuptools wheel
 
 echo "[4/6] Install PyTorch CUDA 12.8 stack"
 PYTHONNOUSERSITE=1 conda run -n "${ENV_NAME}" python -m pip install \
-  torch==2.9.1+cu128 torchvision==0.24.1+cu128 torchaudio==2.9.1+cu128 \
+  torch==2.10.0+cu128 torchvision==0.25.0+cu128 torchaudio==2.10.0+cu128 \
   --index-url https://download.pytorch.org/whl/cu128
 
 echo "[5/6] Install LeRobot + SmolVLA extras (editable)"

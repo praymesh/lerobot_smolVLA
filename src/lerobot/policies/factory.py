@@ -498,7 +498,7 @@ def make_policy(
 
         logging.info("Loading policy's PEFT adapter.")
 
-        peft_pretrained_path = cfg.pretrained_path
+        peft_pretrained_path = str(cfg.pretrained_path)
         peft_config = PeftConfig.from_pretrained(peft_pretrained_path)
 
         kwargs["pretrained_name_or_path"] = peft_config.base_model_name_or_path

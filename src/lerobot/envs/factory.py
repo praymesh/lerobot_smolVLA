@@ -20,7 +20,7 @@ import gymnasium as gym
 from gymnasium.envs.registration import registry as gym_registry
 
 from lerobot.configs.policies import PreTrainedConfig
-from lerobot.envs.configs import AlohaEnv, EnvConfig, HubEnvConfig, IsaaclabArenaEnv, LiberoEnv, PushtEnv
+from lerobot.envs.configs import AlohaEnv, EnvConfig, HubEnvConfig, IsaaclabArenaEnv, LiberoEnv, MetaworldEnv, PushtEnv
 from lerobot.envs.utils import _call_make_env, _download_hub_file, _import_hub_module, _normalize_hub_result
 from lerobot.policies.xvla.configuration_xvla import XVLAConfig
 from lerobot.processor import ProcessorStep
@@ -35,6 +35,8 @@ def make_env_config(env_type: str, **kwargs) -> EnvConfig:
         return PushtEnv(**kwargs)
     elif env_type == "libero":
         return LiberoEnv(**kwargs)
+    elif env_type == "metaworld":
+        return MetaworldEnv(**kwargs)
     else:
         raise ValueError(f"Policy type '{env_type}' is not available.")
 

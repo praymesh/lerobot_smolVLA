@@ -1,176 +1,215 @@
-<p align="center">
-  <img alt="LeRobot, Hugging Face Robotics Library" src="./media/readme/lerobot-logo-thumbnail.png" width="100%">
-</p>
+# SmolVLA with QLoRA (4-bit Quantized VLM + LoRA)
 
-<div align="center">
+**QLoRA** fine-tuning of SmolVLA: the VLM backbone (SmolVLM2-500M) is loaded
+in **4-bit NF4** quantization, then **LoRA adapters** are added on top. This
+cuts VLM memory by ~4× compared to full BF16, and allows the language model to
+adapt to the robot domain instead of staying fully frozen.
 
-[![Tests](https://github.com/huggingface/lerobot/actions/workflows/nightly.yml/badge.svg?branch=main)](https://github.com/huggingface/lerobot/actions/workflows/nightly.yml?query=branch%3Amain)
-[![Python versions](https://img.shields.io/pypi/pyversions/lerobot)](https://www.python.org/downloads/)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/huggingface/lerobot/blob/main/LICENSE)
-[![Status](https://img.shields.io/pypi/status/lerobot)](https://pypi.org/project/lerobot/)
-[![Version](https://img.shields.io/pypi/v/lerobot)](https://pypi.org/project/lerobot/)
-[![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-v2.1-ff69b4.svg)](https://github.com/huggingface/lerobot/blob/main/CODE_OF_CONDUCT.md)
-[![Discord](https://img.shields.io/badge/Discord-Join_Us-5865F2?style=flat&logo=discord&logoColor=white)](https://discord.gg/q8Dzzpym3f)
+---
 
-</div>
+## What Changed vs Base SmolVLA
 
-**LeRobot** aims to provide models, datasets, and tools for real-world robotics in PyTorch. The goal is to lower the barrier to entry so that everyone can contribute to and benefit from shared datasets and pretrained models.
+### Standard SmolVLA fine-tuning (lora branch)
+```
+VLM backbone  → BF16 weights, fully frozen
+Action expert → full precision, trainable
+```
 
-🤗 A hardware-agnostic, Python-native interface that standardizes control across diverse platforms, from low-cost arms (SO-100) to humanoids.
+### This branch (QLoRA)
+```
+VLM backbone  → 4-bit NF4 weights (BitsAndBytes), LoRA adapters trainable
+Action expert → full precision, trainable
+Vision encoder → frozen (no LoRA)
+```
 
-🤗 A standardized, scalable LeRobotDataset format (Parquet + MP4 or images) hosted on the Hugging Face Hub, enabling efficient storage, streaming and visualization of massive robotic datasets.
+Both the action expert **and** the VLM text model learn — QLoRA makes the VLM
+update affordable by keeping base weights at 4-bit and only storing the small
+LoRA delta matrices in BF16.
 
-🤗 State-of-the-art policies that have been shown to transfer to the real-world ready for training and deployment.
+---
 
-🤗 Comprehensive support for the open-source ecosystem to democratize physical AI.
+## Key Files Changed
 
-## Quick Start
+| File | What changed |
+|---|---|
+| `src/lerobot/policies/smolvla/smolvlm_with_expert.py` | `use_qlora` path: loads VLM in 4-bit NF4 via BnB, wraps with LoRA via PEFT; `get_vlm_model()` updated to traverse PeftModel wrappers; `set_requires_grad()` updated for LoRA-only training; `get_compute_dtype()` helper added |
+| `src/lerobot/policies/smolvla/configuration_smolvla.py` | New fields: `use_qlora`, `lora_r`, `lora_alpha`, `lora_dropout`, `lora_target_modules`; validation that `use_qlora` and `train_expert_only` are not both True |
+| `src/lerobot/policies/smolvla/modeling_smolvla.py` | `SmolVLAPolicy.from_pretrained()` overridden to skip `.to(device)` after load; `SmolVLAPolicy.to()` overridden to no-op if VLM is already on GPU; all projection layers explicitly moved to the VLM's device after `device_map="auto"` |
+| `src/lerobot/scripts/lerobot_eval.py` | Policy is loaded **before** the environment to give the 4-bit model priority on GPU memory |
+| `test_qlora_sanity.py` | End-to-end sanity check: loads in QLoRA mode, reports trainable params, VRAM usage, runs a forward pass, verifies LoRA placement |
 
-LeRobot can be installed directly from PyPI.
+---
+
+## New Configuration Fields
+
+Add these to your training command via `--policy.*`:
+
+| Field | Default | Description |
+|---|---|---|
+| `use_qlora` | `False` | Enable 4-bit NF4 quantization + LoRA on the VLM |
+| `lora_r` | `16` | LoRA rank |
+| `lora_alpha` | `32` | LoRA alpha (scaling = alpha / r) |
+| `lora_dropout` | `0.05` | Dropout on LoRA layers |
+| `lora_target_modules` | `["q_proj","k_proj","v_proj","o_proj","proj"]` | Which linear layers get LoRA (full attention + connector) |
+
+> `use_qlora=True` is **incompatible** with `train_expert_only=True`.
+> QLoRA trains LoRA params in the VLM text model, so the VLM must not be
+> fully frozen. Setting both raises a `ValueError` at startup.
+
+---
+
+## Engineering Details
+
+### 4-bit quantization config (BitsAndBytes)
+```python
+BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",           # NormalFloat4 — best accuracy at 4-bit
+    bnb_4bit_use_double_quant=True,      # quantize the quantization constants too (~0.4 bit extra savings)
+    bnb_4bit_compute_dtype=torch.bfloat16,  # activations and LoRA remain BF16
+)
+```
+
+### Device placement problem — and the fix
+`device_map="auto"` (used by BnB) places the VLM on GPU automatically.
+Calling `.to(device)` after the fact causes OOM by attempting to duplicate
+the already-placed model. Two overrides prevent this:
+
+- **`SmolVLAPolicy.from_pretrained()`** — loads weights to CPU via
+  `safetensors`, then lets PyTorch's in-place `copy_` move them to wherever
+  each parameter already lives (GPU for VLM, CPU for the rest). Skips the
+  final `policy.to(device)`.
+- **`SmolVLAPolicy.to()`** — checks if the VLM is already on CUDA; if so,
+  returns `self` immediately instead of calling `super().to()`.
+
+All projection layers (`state_proj`, `action_in_proj`, etc.) are explicitly
+moved to the VLM's device after initialization to keep everything on the same
+device.
+
+### `get_compute_dtype` helper
+BnB 4-bit layers store weights as `uint8` (not a floating-point dtype).
+The existing code that does `hidden_states.to(dtype=layer.weight.dtype)` would
+fail. `get_compute_dtype()` returns `bfloat16` for quantized layers and the
+actual weight dtype otherwise.
+
+### `prepare_model_for_kbit_training`
+Called before wrapping with LoRA. This:
+- Enables gradient checkpointing on the VLM (saves activation memory at the
+  cost of a small compute overhead)
+- Casts non-quantized parameters (LayerNorm, embeddings) to `float32` for
+  numerical stability
+
+### Eval order swap
+`lerobot_eval.py` now loads the policy **before** creating the simulation
+environment. On a 6 GB GPU, the BnB 4-bit model claims its memory first;
+the env renderer then uses whatever remains, preventing OOM during eval.
+
+---
+
+## Setup
 
 ```bash
-pip install lerobot
-lerobot-info
+# 1. Install base LeRobot + SmolVLA
+pip install -e ".[smolvla]"
+
+# 2. Install QLoRA requirements
+pip install -r requirements.txt
 ```
 
-> [!IMPORTANT]
-> For detailed installation guide, please see the [Installation Documentation](https://huggingface.co/docs/lerobot/installation).
+---
 
-## Robots & Control
+## Sanity Check
 
-<div align="center">
-  <img src="./media/readme/robots_control_video.webp" width="640px" alt="Reachy 2 Demo">
-</div>
+Run before training to verify QLoRA loads correctly and VRAM fits:
 
-LeRobot provides a unified `Robot` class interface that decouples control logic from hardware specifics. It supports a wide range of robots and teleoperation devices.
-
-```python
-from lerobot.robots.myrobot import MyRobot
-
-# Connect to a robot
-robot = MyRobot(config=...)
-robot.connect()
-
-# Read observation and send action
-obs = robot.get_observation()
-action = model.select_action(obs)
-robot.send_action(action)
+```bash
+python test_qlora_sanity.py
 ```
 
-**Supported Hardware:** SO100, LeKiwi, Koch, HopeJR, OMX, EarthRover, Reachy2, Gamepads, Keyboards, Phones, OpenARM, Unitree G1.
+Expected output (RTX 3050 6 GB):
+```
+GPU : NVIDIA GeForce RTX 3050 ...
+VRAM: 6.0 GB
 
-While these devices are natively integrated into the LeRobot codebase, the library is designed to be extensible. You can easily implement the Robot interface to utilize LeRobot's data collection, training, and visualization tools for your own custom robot.
+Loading SmolVLM2-500M in 4-bit QLoRA mode ...
+QLoRA enabled: VLM loaded in 4-bit NF4, LoRA r=16 on [q_proj, k_proj, ...]
 
-For detailed hardware setup guides, see the [Hardware Documentation](https://huggingface.co/docs/lerobot/integrate_hardware).
+--- Trainable Parameters ---
+  Expert (action head) :  X.XX M
+  VLM LoRA adapters    :  X.XX M
+  Total trainable      :  X.XX M / XXX.XX M  (X.XX %)
 
-## LeRobot Dataset
+--- GPU Memory After Load ---
+  Allocated : ~1.5–2.0 GB
+  Remaining : ~4.0 GB free for activations / optimizer
 
-To solve the data fragmentation problem in robotics, we utilize the **LeRobotDataset** format.
+--- LoRA Adapter Check ---
+  Vision encoder LoRA : N layers  frozen=True  ✓
+  Text model LoRA     : N layers  trainable=True  ✓
 
-- **Structure:** Synchronized MP4 videos (or images) for vision and Parquet files for state/action data.
-- **HF Hub Integration:** Explore thousands of robotics datasets on the [Hugging Face Hub](https://huggingface.co/lerobot).
-- **Tools:** Seamlessly delete episodes, split by indices/fractions, add/remove features, and merge multiple datasets.
-
-```python
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
-
-# Load a dataset from the Hub
-dataset = LeRobotDataset("lerobot/aloha_mobile_cabinet")
-
-# Access data (automatically handles video decoding)
-episode_index=0
-print(f"{dataset[episode_index]['action'].shape=}\n")
+✓  All checks passed — QLoRA is set up correctly.
 ```
 
-Learn more about it in the [LeRobotDataset Documentation](https://huggingface.co/docs/lerobot/lerobot-dataset-v3)
+---
 
-## SoTA Models
-
-LeRobot implements state-of-the-art policies in pure PyTorch, covering Imitation Learning, Reinforcement Learning, and Vision-Language-Action (VLA) models, with more coming soon. It also provides you with the tools to instrument and inspect your training process.
-
-<p align="center">
-  <img alt="Gr00t Architecture" src="./media/readme/VLA_architecture.jpg" width="640px">
-</p>
-
-Training a policy is as simple as running a script configuration:
+## Training
 
 ```bash
 lerobot-train \
-  --policy=act \
-  --dataset.repo_id=lerobot/aloha_mobile_cabinet
+  --policy.path=lerobot/smolvla_base \
+  --policy.push_to_hub=false \
+  --policy.use_qlora=true \
+  --policy.lora_r=16 \
+  --policy.lora_alpha=32 \
+  --dataset.repo_id=lerobot/aloha_sim_transfer_cube_human \
+  --dataset.episodes="[$(seq -s, 0 49)]" \
+  --rename_map='{"observation.images.top":"observation.images.camera1","observation.images.wrist":"observation.images.camera2"}' \
+  --batch_size=2 \
+  --steps=40000 \
+  --save_freq=4000 \
+  --log_freq=100 \
+  --output_dir=outputs/train/qlora_run \
+  --job_name=qlora_smolvla \
+  --policy.device=cuda \
+  --policy.use_amp=true \
+  --num_workers=0
 ```
 
-| Category                   | Models                                                                                                                                                                                                       |
-| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Imitation Learning**     | [ACT](./docs/source/policy_act_README.md), [Diffusion](./docs/source/policy_diffusion_README.md), [VQ-BeT](./docs/source/policy_vqbet_README.md)                                                             |
-| **Reinforcement Learning** | [HIL-SERL](./docs/source/hilserl.mdx), [TDMPC](./docs/source/policy_tdmpc_README.md) & QC-FQL (coming soon)                                                                                                  |
-| **VLAs Models**            | [Pi0Fast](./docs/source/pi0fast.mdx), [Pi0.5](./docs/source/pi05.mdx), [GR00T N1.5](./docs/source/policy_groot_README.md), [SmolVLA](./docs/source/policy_smolvla_README.md), [XVLA](./docs/source/xvla.mdx) |
-
-Similarly to the hardware, you can easily implement your own policy & leverage LeRobot's data collection, training, and visualization tools, and share your model to the HF Hub
-
-For detailed policy setup guides, see the [Policy Documentation](https://huggingface.co/docs/lerobot/bring_your_own_policies).
-
-## Inference & Evaluation
-
-Evaluate your policies in simulation or on real hardware using the unified evaluation script. LeRobot supports standard benchmarks like **LIBERO**, **MetaWorld** and more to come.
-
+For **LIBERO**:
 ```bash
-# Evaluate a policy on the LIBERO benchmark
-lerobot-eval \
-  --policy.path=lerobot/pi0_libero_finetuned \
-  --env.type=libero \
-  --env.task=libero_object \
-  --eval.n_episodes=10
+--dataset.repo_id=lerobot/libero
+--rename_map='{"observation.images.image":"observation.images.camera1","observation.images.image2":"observation.images.camera2"}'
 ```
 
-Learn how to implement your own simulation environment or benchmark and distribute it from the HF Hub by following the [EnvHub Documentation](https://huggingface.co/docs/lerobot/envhub)
+> **RTX 3050 6 GB:** QLoRA reduces VLM memory from ~2 GB (BF16) to ~0.5 GB
+> (4-bit), freeing headroom for larger batches or longer sequences. Keep
+> `--batch_size=2` and `--num_workers=0`.
 
-## Resources
+---
 
-- **[Documentation](https://huggingface.co/docs/lerobot/index):** The complete guide to tutorials & API.
-- **[Chinese Tutorials: LeRobot+SO-ARM101中文教程-同济子豪兄](https://zihao-ai.feishu.cn/wiki/space/7589642043471924447)** Detailed doc for assembling, teleoperate, dataset, train, deploy. Verified by Seed Studio and 5 global hackathon players.
-- **[Discord](https://discord.gg/q8Dzzpym3f):** Join the `LeRobot` server to discuss with the community.
-- **[X](https://x.com/LeRobotHF):** Follow us on X to stay up-to-date with the latest developments.
-- **[Robot Learning Tutorial](https://huggingface.co/spaces/lerobot/robot-learning-tutorial):** A free, hands-on course to learn robot learning using LeRobot.
+## Architecture Summary
 
-## Citation
-
-If you use LeRobot in your project, please cite the GitHub repository to acknowledge the ongoing development and contributors:
-
-```bibtex
-@misc{cadene2024lerobot,
-    author = {Cadene, Remi and Alibert, Simon and Soare, Alexander and Gallouedec, Quentin and Zouitine, Adil and Palma, Steven and Kooijmans, Pepijn and Aractingi, Michel and Shukor, Mustafa and Aubakirova, Dana and Russi, Martino and Capuano, Francesco and Pascal, Caroline and Choghari, Jade and Moss, Jess and Wolf, Thomas},
-    title = {LeRobot: State-of-the-art Machine Learning for Real-World Robotics in Pytorch},
-    howpublished = "\url{https://github.com/huggingface/lerobot}",
-    year = {2024}
-}
+```
+SmolVLMWithExpertModel
+├── vlm  (PeftModel wrapping SmolVLMForConditionalGeneration)
+│   └── base_model
+│       └── model  (SmolVLMModel)
+│           ├── vision_model  (SigLIP)         [FROZEN — no LoRA]
+│           ├── connector     (Linear + GELU)  [LoRA adapters, trainable]
+│           └── text_model    (SmolLM)         [4-bit NF4 weights]
+│               └── layers[i].self_attn.*_proj [LoRA adapters, trainable]
+└── lm_expert  (action expert, full BF16 precision) [trainable]
 ```
 
-If you are referencing our research or the academic paper, please also cite our ICLR publication:
+---
 
-<details>
-<summary><b>ICLR 2026 Paper</b></summary>
+## Comparison: LoRA vs QLoRA
 
-```bibtex
-@inproceedings{cadenelerobot,
-  title={LeRobot: An Open-Source Library for End-to-End Robot Learning},
-  author={Cadene, Remi and Alibert, Simon and Capuano, Francesco and Aractingi, Michel and Zouitine, Adil and Kooijmans, Pepijn and Choghari, Jade and Russi, Martino and Pascal, Caroline and Palma, Steven and Shukor, Mustafa and Moss, Jess and Soare, Alexander and Aubakirova, Dana and Lhoest, Quentin and Gallou\'edec, Quentin and Wolf, Thomas},
-  booktitle={The Fourteenth International Conference on Learning Representations},
-  year={2026},
-  url={https://arxiv.org/abs/2602.22818}
-}
-```
-
-</details>
-
-## Contribute
-
-We welcome contributions from everyone in the community! To get started, please read our [CONTRIBUTING.md](https://github.com/huggingface/lerobot/blob/main/CONTRIBUTING.md) guide. Whether you're adding a new feature, improving documentation, or fixing a bug, your help and feedback are invaluable. We're incredibly excited about the future of open-source robotics and can't wait to work with you on what's next—thank you for your support!
-
-<p align="center">
-  <img alt="SO101 Video" src="./media/readme/so100_video.webp" width="640px">
-</p>
-
-<div align="center">
-<sub>Built by the <a href="https://huggingface.co/lerobot">LeRobot</a> team at <a href="https://huggingface.co">Hugging Face</a> with ❤️</sub>
-</div>
+| | LoRA branch | QLoRA branch (this) |
+|---|---|---|
+| VLM backbone precision | BF16 (~2 GB) | 4-bit NF4 (~0.5 GB) |
+| VLM text model trainable | No (fully frozen) | Yes (via LoRA adapters) |
+| Vision encoder trainable | No | No |
+| Action expert trainable | Yes | Yes |
+| Extra dependencies | `peft` | `peft`, `bitsandbytes` |
+| Min VRAM | ~4 GB | ~3 GB |

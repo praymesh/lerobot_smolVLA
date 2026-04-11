@@ -177,3 +177,8 @@ outputs/
 *.urdf
 *.xml
 *.part
+
+# lora_action_expert
+outputs/
+train_aloha_r32_d50_20260411_201928.log
+.claude

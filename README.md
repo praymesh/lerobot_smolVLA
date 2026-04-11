@@ -1,176 +1,210 @@
-<p align="center">
-  <img alt="LeRobot, Hugging Face Robotics Library" src="./media/readme/lerobot-logo-thumbnail.png" width="100%">
-</p>
+# LoRA Fine-Tuning of SmolVLA Action Expert
 
-<div align="center">
+Fine-tuning only the **action expert** of [SmolVLA](https://huggingface.co/lerobot/smolvla_base)
+using LoRA (Low-Rank Adaptation), while keeping the SmolVLM-500M-Instruct backbone fully frozen.
 
-[![Tests](https://github.com/huggingface/lerobot/actions/workflows/nightly.yml/badge.svg?branch=main)](https://github.com/huggingface/lerobot/actions/workflows/nightly.yml?query=branch%3Amain)
-[![Python versions](https://img.shields.io/pypi/pyversions/lerobot)](https://www.python.org/downloads/)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/huggingface/lerobot/blob/main/LICENSE)
-[![Status](https://img.shields.io/pypi/status/lerobot)](https://pypi.org/project/lerobot/)
-[![Version](https://img.shields.io/pypi/v/lerobot)](https://pypi.org/project/lerobot/)
-[![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-v2.1-ff69b4.svg)](https://github.com/huggingface/lerobot/blob/main/CODE_OF_CONDUCT.md)
-[![Discord](https://img.shields.io/badge/Discord-Join_Us-5865F2?style=flat&logo=discord&logoColor=white)](https://discord.gg/q8Dzzpym3f)
+---
 
-</div>
+## Architecture: What Gets Trained
 
-**LeRobot** aims to provide models, datasets, and tools for real-world robotics in PyTorch. The goal is to lower the barrier to entry so that everyone can contribute to and benefit from shared datasets and pretrained models.
+SmolVLA consists of two parts:
 
-🤗 A hardware-agnostic, Python-native interface that standardizes control across diverse platforms, from low-cost arms (SO-100) to humanoids.
+| Component | Description | Frozen? |
+|---|---|---|
+| SmolVLM-500M-Instruct backbone | Vision encoder + language text model | **Yes** |
+| Action expert (`lm_expert`) | Smaller transformer that processes noisy actions | **No — LoRA here** |
+| Action projections | `action_in_proj`, `action_out_proj`, `action_time_mlp_in/out` | **No — LoRA here** |
 
-🤗 A standardized, scalable LeRobotDataset format (Parquet + MP4 or images) hosted on the Hugging Face Hub, enabling efficient storage, streaming and visualization of massive robotic datasets.
+The LoRA adapters target:
+- `model.vlm_with_expert.lm_expert.*.q_proj` and `*.v_proj` — attention layers of the action expert
+- `model.action_in_proj`, `model.action_out_proj`, `model.action_time_mlp_in`, `model.action_time_mlp_out` — action I/O projections
 
-🤗 State-of-the-art policies that have been shown to transfer to the real-world ready for training and deployment.
+Defined in `src/lerobot/policies/smolvla/modeling_smolvla.py` (lines 484–493).
 
-🤗 Comprehensive support for the open-source ecosystem to democratize physical AI.
+---
 
-## Quick Start
-
-LeRobot can be installed directly from PyPI.
+## Setup
 
 ```bash
-pip install lerobot
-lerobot-info
+# 1. Install base LeRobot + SmolVLA dependencies
+pip install -e ".[smolvla]"
+
+# 2. Install our additional requirements
+pip install -r requirements.txt
 ```
 
-> [!IMPORTANT]
-> For detailed installation guide, please see the [Installation Documentation](https://huggingface.co/docs/lerobot/installation).
-
-## Robots & Control
-
-<div align="center">
-  <img src="./media/readme/robots_control_video.webp" width="640px" alt="Reachy 2 Demo">
-</div>
-
-LeRobot provides a unified `Robot` class interface that decouples control logic from hardware specifics. It supports a wide range of robots and teleoperation devices.
-
-```python
-from lerobot.robots.myrobot import MyRobot
-
-# Connect to a robot
-robot = MyRobot(config=...)
-robot.connect()
-
-# Read observation and send action
-obs = robot.get_observation()
-action = model.select_action(obs)
-robot.send_action(action)
+For faster dataset downloads (recommended — avoids network hangs):
+```bash
+pip install hf-transfer
+export HF_HUB_ENABLE_HF_TRANSFER=1
 ```
 
-**Supported Hardware:** SO100, LeKiwi, Koch, HopeJR, OMX, EarthRover, Reachy2, Gamepads, Keyboards, Phones, OpenARM, Unitree G1.
+---
 
-While these devices are natively integrated into the LeRobot codebase, the library is designed to be extensible. You can easily implement the Robot interface to utilize LeRobot's data collection, training, and visualization tools for your own custom robot.
+## Training
 
-For detailed hardware setup guides, see the [Hardware Documentation](https://huggingface.co/docs/lerobot/integrate_hardware).
-
-## LeRobot Dataset
-
-To solve the data fragmentation problem in robotics, we utilize the **LeRobotDataset** format.
-
-- **Structure:** Synchronized MP4 videos (or images) for vision and Parquet files for state/action data.
-- **HF Hub Integration:** Explore thousands of robotics datasets on the [Hugging Face Hub](https://huggingface.co/lerobot).
-- **Tools:** Seamlessly delete episodes, split by indices/fractions, add/remove features, and merge multiple datasets.
-
-```python
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
-
-# Load a dataset from the Hub
-dataset = LeRobotDataset("lerobot/aloha_mobile_cabinet")
-
-# Access data (automatically handles video decoding)
-episode_index=0
-print(f"{dataset[episode_index]['action'].shape=}\n")
-```
-
-Learn more about it in the [LeRobotDataset Documentation](https://huggingface.co/docs/lerobot/lerobot-dataset-v3)
-
-## SoTA Models
-
-LeRobot implements state-of-the-art policies in pure PyTorch, covering Imitation Learning, Reinforcement Learning, and Vision-Language-Action (VLA) models, with more coming soon. It also provides you with the tools to instrument and inspect your training process.
-
-<p align="center">
-  <img alt="Gr00t Architecture" src="./media/readme/VLA_architecture.jpg" width="640px">
-</p>
-
-Training a policy is as simple as running a script configuration:
+### ALOHA (default config in the script)
 
 ```bash
-lerobot-train \
-  --policy=act \
-  --dataset.repo_id=lerobot/aloha_mobile_cabinet
+./train_action_lora_multi.sh
 ```
 
-| Category                   | Models                                                                                                                                                                                                       |
-| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Imitation Learning**     | [ACT](./docs/source/policy_act_README.md), [Diffusion](./docs/source/policy_diffusion_README.md), [VQ-BeT](./docs/source/policy_vqbet_README.md)                                                             |
-| **Reinforcement Learning** | [HIL-SERL](./docs/source/hilserl.mdx), [TDMPC](./docs/source/policy_tdmpc_README.md) & QC-FQL (coming soon)                                                                                                  |
-| **VLAs Models**            | [Pi0Fast](./docs/source/pi0fast.mdx), [Pi0.5](./docs/source/pi05.mdx), [GR00T N1.5](./docs/source/policy_groot_README.md), [SmolVLA](./docs/source/policy_smolvla_README.md), [XVLA](./docs/source/xvla.mdx) |
+This runs a single experiment: **rank 32, 50 demonstrations, 40 000 steps**,
+with checkpoints saved every 4 000 steps.
 
-Similarly to the hardware, you can easily implement your own policy & leverage LeRobot's data collection, training, and visualization tools, and share your model to the HF Hub
+Training output lands in:
+```
+outputs/train/aloha_r32_d50_<timestamp>/
+  checkpoints/          # one folder per 4k steps + "last" symlink
+  train_loss.csv        # step,loss CSV for plotting (generated at end)
+```
 
-For detailed policy setup guides, see the [Policy Documentation](https://huggingface.co/docs/lerobot/bring_your_own_policies).
+The raw training log is at `train_aloha_r32_d50_<timestamp>.log` in the repo
+root during training, then moved into the output directory on completion.
 
-## Inference & Evaluation
+### LIBERO
 
-Evaluate your policies in simulation or on real hardware using the unified evaluation script. LeRobot supports standard benchmarks like **LIBERO**, **MetaWorld** and more to come.
+Change the following variables at the top of `train_action_lora_multi.sh`:
 
 ```bash
-# Evaluate a policy on the LIBERO benchmark
-lerobot-eval \
-  --policy.path=lerobot/pi0_libero_finetuned \
-  --env.type=libero \
-  --env.task=libero_object \
-  --eval.n_episodes=10
+DATASET="lerobot/libero"
+RENAME_MAP='{"observation.images.image":"observation.images.camera1","observation.images.image2":"observation.images.camera2"}'
 ```
 
-Learn how to implement your own simulation environment or benchmark and distribute it from the HF Hub by following the [EnvHub Documentation](https://huggingface.co/docs/lerobot/envhub)
+The LIBERO episodes already use the same `top`/`wrist` → `camera1`/`camera2`
+mapping convention, just with different source key names.
 
-## Resources
+### Changing the LoRA rank
 
-- **[Documentation](https://huggingface.co/docs/lerobot/index):** The complete guide to tutorials & API.
-- **[Chinese Tutorials: LeRobot+SO-ARM101中文教程-同济子豪兄](https://zihao-ai.feishu.cn/wiki/space/7589642043471924447)** Detailed doc for assembling, teleoperate, dataset, train, deploy. Verified by Seed Studio and 5 global hackathon players.
-- **[Discord](https://discord.gg/q8Dzzpym3f):** Join the `LeRobot` server to discuss with the community.
-- **[X](https://x.com/LeRobotHF):** Follow us on X to stay up-to-date with the latest developments.
-- **[Robot Learning Tutorial](https://huggingface.co/spaces/lerobot/robot-learning-tutorial):** A free, hands-on course to learn robot learning using LeRobot.
+Edit `train_action_lora_multi.sh`:
 
-## Citation
-
-If you use LeRobot in your project, please cite the GitHub repository to acknowledge the ongoing development and contributors:
-
-```bibtex
-@misc{cadene2024lerobot,
-    author = {Cadene, Remi and Alibert, Simon and Soare, Alexander and Gallouedec, Quentin and Zouitine, Adil and Palma, Steven and Kooijmans, Pepijn and Aractingi, Michel and Shukor, Mustafa and Aubakirova, Dana and Russi, Martino and Capuano, Francesco and Pascal, Caroline and Choghari, Jade and Moss, Jess and Wolf, Thomas},
-    title = {LeRobot: State-of-the-art Machine Learning for Real-World Robotics in Pytorch},
-    howpublished = "\url{https://github.com/huggingface/lerobot}",
-    year = {2024}
-}
+```bash
+R=32        # change to 4, 8, 16, 64, etc.
 ```
 
-If you are referencing our research or the academic paper, please also cite our ICLR publication:
+The rank is passed to the training script via the `LORA_RANK` environment
+variable. `lora_alpha` is automatically set to `2 × rank` (standard default).
 
-<details>
-<summary><b>ICLR 2026 Paper</b></summary>
+### Sweeping multiple ranks / demo counts
 
-```bibtex
-@inproceedings{cadenelerobot,
-  title={LeRobot: An Open-Source Library for End-to-End Robot Learning},
-  author={Cadene, Remi and Alibert, Simon and Capuano, Francesco and Aractingi, Michel and Zouitine, Adil and Kooijmans, Pepijn and Choghari, Jade and Russi, Martino and Pascal, Caroline and Palma, Steven and Shukor, Mustafa and Moss, Jess and Soare, Alexander and Aubakirova, Dana and Lhoest, Quentin and Gallou\'edec, Quentin and Wolf, Thomas},
-  booktitle={The Fourteenth International Conference on Learning Representations},
-  year={2026},
-  url={https://arxiv.org/abs/2602.22818}
-}
+To run a grid sweep (e.g. ranks 4, 16, 32 × demo counts 20, 50), replace the
+fixed variables with loops:
+
+```bash
+RANKS=(4 16 32)
+DEMO_COUNTS=(20 50)
+
+for R in "${RANKS[@]}"; do
+  for DEMO_COUNT in "${DEMO_COUNTS[@]}"; do
+    # ... rest of the training block
+  done
+done
 ```
 
-</details>
+---
 
-## Contribute
+## Key Training Files
 
-We welcome contributions from everyone in the community! To get started, please read our [CONTRIBUTING.md](https://github.com/huggingface/lerobot/blob/main/CONTRIBUTING.md) guide. Whether you're adding a new feature, improving documentation, or fixing a bug, your help and feedback are invaluable. We're incredibly excited about the future of open-source robotics and can't wait to work with you on what's next—thank you for your support!
+| File | Purpose |
+|---|---|
+| `train_action_lora_multi.sh` | Main training script (edit to change dataset / rank) |
+| `run_exp2_lora.py` | Python entry-point: patches model loading and applies LoRA |
 
-<p align="center">
-  <img alt="SO101 Video" src="./media/readme/so100_video.webp" width="640px">
-</p>
+`run_exp2_lora.py` operates in two modes:
 
-<div align="center">
-<sub>Built by the <a href="https://huggingface.co/lerobot">LeRobot</a> team at <a href="https://huggingface.co">Hugging Face</a> with ❤️</sub>
-</div>
+- **Training** (no `adapter_config.json` found): applies a fresh LoRA using
+  `get_peft_model` with the specified rank. All base model weights are frozen.
+- **Eval** (`adapter_config.json` found at `pretrained_path`): loads saved
+  LoRA delta weights via `PeftModel.from_pretrained` for inference.
+
+---
+
+## Plotting the Loss Curve
+
+After training completes, `train_loss.csv` is auto-generated. To plot:
+
+```bash
+python plot_loss.py outputs/train/aloha_r32_d50_<timestamp>/train_loss.csv
+```
+
+Options:
+```
+--smooth 0.95    # stronger EMA smoothing (default 0.9, range 0–1)
+--no-smooth      # show raw values only
+```
+
+The PNG is saved next to the CSV automatically.
+
+If training was interrupted or the CSV was not generated, extract it manually:
+
+```bash
+python plot_loss.py <path/to/train.log>   # works on the raw log too
+```
+
+Or regenerate the CSV from an existing log:
+
+```bash
+python - train_<jobname>.log outputs/train/<jobname>/train_loss.csv <<'PY'
+import re, sys, csv
+def p(s):
+    if s.endswith("K"): return int(float(s[:-1])*1000)
+    return int(float(s))
+rows = []
+for line in open(sys.argv[1]):
+    sm = re.search(r"\bstep:([\d.KMB]+)", line)
+    lm = re.search(r"\bloss:([\d.eE+\-]+)", line)
+    if sm and lm: rows.append((p(sm.group(1)), float(lm.group(1))))
+w = csv.writer(open(sys.argv[2], "w"))
+w.writerow(["step", "loss"]); w.writerows(rows)
+print(f"{len(rows)} rows written")
+PY
+```
+
+---
+
+## Evaluation
+
+### ALOHA
+
+```bash
+./eval_aloha_lora.sh
+```
+
+Runs 5 episodes of `AlohaTransferCube-v0` using the trained checkpoint at
+`outputs/train/aloha_r32_d50_<timestamp>/checkpoints/last/pretrained_model`.
+
+To change the checkpoint, edit `CKPT` in `eval_aloha_lora.sh`.
+To run more episodes (for a reliable success rate), change `N_EPISODES`.
+
+### LIBERO
+
+```bash
+./eval_libero_lora.sh
+```
+
+Sweeps all trained LIBERO checkpoints under `outputs/train/exp2_r*/`.
+
+### How evaluation loads LoRA
+
+Evaluation uses `eval_lora_smolvla.py`, which:
+
+1. Reads `train_config.json` from the adapter checkpoint to find the base
+   model path (`lerobot/smolvla_base`).
+2. Loads the full pretrained base model.
+3. Applies the saved LoRA delta weights via `PeftModel.from_pretrained`.
+4. Runs the lerobot eval loop.
+
+---
+
+## Dataset Camera Key Mapping
+
+SmolVLA expects camera observations named `camera1` (and optionally `camera2`).
+Both ALOHA and LIBERO use different names in their environments, so a
+`rename_map` is passed at both training and eval time:
+
+| Dataset | Raw key | Policy key |
+|---|---|---|
+| ALOHA | `observation.images.top` | `observation.images.camera1` |
+| ALOHA | `observation.images.wrist` | `observation.images.camera2` |
+| LIBERO | `observation.images.image` | `observation.images.camera1` |
+| LIBERO | `observation.images.image2` | `observation.images.camera2` |

@@ -33,6 +33,7 @@ model = SmolVLMWithExpertModel(
     model_id="HuggingFaceTB/SmolVLM2-500M-Video-Instruct",
     load_vlm_weights=True,
     train_expert_only=False,
+    freeze_vision_encoder=True,   # matches SmolVLAConfig default
     use_qlora=True,
     lora_r=16,
     lora_alpha=32,
@@ -74,13 +75,17 @@ if torch.cuda.is_available():
     alloc = torch.cuda.memory_allocated(0) / 1024**3
     print(f"  GPU after forward  : {alloc:.2f} GB allocated")
 
-# LoRA adapter check — make sure they are trainable
+# LoRA adapter check — vision encoder must be frozen, text model must be trainable
 print("\n--- LoRA Adapter Check ---")
 lora_params = [(n, p) for n, p in model.vlm.named_parameters() if "lora_A" in n or "lora_B" in n]
-print(f"  LoRA layers found  : {len(lora_params)}")
-for n, p in lora_params[:4]:
-    print(f"    {n}  requires_grad={p.requires_grad}")
-if len(lora_params) > 4:
-    print(f"    ... and {len(lora_params) - 4} more")
+vision_lora  = [(n, p) for n, p in lora_params if "vision_model" in n]
+text_lora    = [(n, p) for n, p in lora_params if "vision_model" not in n]
+
+vision_frozen  = all(not p.requires_grad for _, p in vision_lora)
+text_trainable = all(p.requires_grad for _, p in text_lora)
+
+print(f"  Total LoRA layers       : {len(lora_params)}")
+print(f"  Vision encoder LoRA     : {len(vision_lora)} layers  frozen={vision_frozen}  {'✓' if vision_frozen else '✗ PROBLEM'}")
+print(f"  Text model LoRA         : {len(text_lora)} layers  trainable={text_trainable}  {'✓' if text_trainable else '✗ PROBLEM'}")
 
 print("\n✓  All checks passed — QLoRA is set up correctly.")

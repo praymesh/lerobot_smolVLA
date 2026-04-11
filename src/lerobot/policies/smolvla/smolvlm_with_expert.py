@@ -192,21 +192,15 @@ class SmolVLMWithExpertModel(nn.Module):
         return obj
 
     def set_requires_grad(self):
-        if self.freeze_vision_encoder:
-            self.get_vlm_model().vision_model.eval()
-            for params in self.get_vlm_model().vision_model.parameters():
-                params.requires_grad = False
-
         if self.use_qlora:
-            # Freeze all VLM params except LoRA adapters (already requires_grad=True from PEFT).
+            # Single explicit pass: only train LoRA params that are NOT in the vision encoder.
+            # Everything else (base weights, vision encoder LoRA) stays frozen.
             for name, params in self.vlm.named_parameters():
-                if "lora_" not in name:
-                    params.requires_grad = False
-            # Also freeze LoRA params inside vision encoder (freeze_vision_encoder=True).
+                is_lora = "lora_" in name
+                in_vision = "vision_model" in name
+                params.requires_grad = is_lora and not (self.freeze_vision_encoder and in_vision)
             if self.freeze_vision_encoder:
-                for name, params in self.vlm.named_parameters():
-                    if "vision_model" in name:
-                        params.requires_grad = False
+                self.get_vlm_model().vision_model.eval()
         elif self.train_expert_only:
             self.vlm.eval()
             for params in self.vlm.parameters():

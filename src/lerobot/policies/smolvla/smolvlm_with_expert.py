@@ -25,6 +25,14 @@ from transformers import (
 )
 
 
+def get_compute_dtype(linear_module) -> torch.dtype:
+    """Return the floating-point compute dtype of a linear layer.
+    For 4-bit quantized (BnB) layers, weight.dtype is uint8 (storage).
+    In that case fall back to BF16 which matches bnb_4bit_compute_dtype."""
+    dtype = linear_module.weight.dtype
+    return dtype if dtype.is_floating_point else torch.bfloat16
+
+
 def apply_rope(x, positions, max_wavelength=10_000):
     """
     Applies RoPE positions [B, L] to x [B, L, H, D].
@@ -71,15 +79,36 @@ class SmolVLMWithExpertModel(nn.Module):
         self_attn_every_n_layers: int = -1,
         expert_width_multiplier: float = 0.5,
         device: str = "auto",
+        use_qlora: bool = False,
+        lora_r: int = 16,
+        lora_alpha: int = 32,
+        lora_dropout: float = 0.05,
+        lora_target_modules: list = None,
     ):
         super().__init__()
+        self.use_qlora = use_qlora
         if load_vlm_weights:
             print(f"Loading  {model_id} weights ...")
-            self.vlm = AutoModelForImageTextToText.from_pretrained(
-                model_id,
-                torch_dtype="bfloat16",
-                low_cpu_mem_usage=True,
-            )
+            if use_qlora:
+                from transformers import BitsAndBytesConfig
+
+                bnb_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_quant_type="nf4",        # NormalFloat4 — best accuracy at 4-bit
+                    bnb_4bit_use_double_quant=True,   # quantize the quantization constants too
+                    bnb_4bit_compute_dtype=torch.bfloat16,  # activations stay BF16
+                )
+                self.vlm = AutoModelForImageTextToText.from_pretrained(
+                    model_id,
+                    quantization_config=bnb_config,
+                    low_cpu_mem_usage=True,
+                )
+            else:
+                self.vlm = AutoModelForImageTextToText.from_pretrained(
+                    model_id,
+                    torch_dtype="bfloat16",
+                    low_cpu_mem_usage=True,
+                )
             config = self.vlm.config
         else:
             config = AutoConfig.from_pretrained(model_id)
@@ -123,6 +152,12 @@ class SmolVLMWithExpertModel(nn.Module):
         # Remove unused embed_tokens
         self.lm_expert.embed_tokens = None
 
+        # Move expert to the same device as the VLM after all modifications are done
+        # (device_map="auto" may place VLM on GPU; cross-attn k/v proj must be on same device).
+        if load_vlm_weights:
+            _vlm_device = next(self.get_vlm_model().parameters()).device
+            self.lm_expert = self.lm_expert.to(_vlm_device)
+
         self.num_attention_heads = self.config.text_config.num_attention_heads
         self.num_key_value_heads = self.config.text_config.num_key_value_heads
 
@@ -130,17 +165,57 @@ class SmolVLMWithExpertModel(nn.Module):
         self.train_expert_only = train_expert_only
         self.attention_mode = attention_mode
         self.expert_hidden_size = lm_expert_config.hidden_size
+
+        if use_qlora and load_vlm_weights:
+            from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+
+            if lora_target_modules is None:
+                lora_target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "proj"]
+            # Prepares 4-bit model for training: enables gradient checkpointing,
+            # casts non-quantized params (LayerNorm, embed) to float32 for stability.
+            prepare_model_for_kbit_training(self.vlm, use_gradient_checkpointing=True)
+            lora_config = LoraConfig(
+                r=lora_r,
+                lora_alpha=lora_alpha,
+                target_modules=lora_target_modules,
+                lora_dropout=lora_dropout,
+                bias="none",
+            )
+            # Wrap the whole VLM so LoRA reaches both the text model and the connector.
+            # PEFT proxies attribute access so self.vlm.model still resolves correctly.
+            # Vision encoder layers are excluded via modules_to_save / target_modules names.
+            self.vlm = get_peft_model(self.vlm, lora_config)
+            print(
+                f"QLoRA enabled: VLM loaded in 4-bit NF4, LoRA r={lora_r} on "
+                f"{lora_target_modules}."
+            )
+
         self.set_requires_grad()
 
     def get_vlm_model(self):
-        return self.vlm.model
+        # Traverse PeftModel / LoraModel wrappers until we reach SmolVLMModel
+        # (identified by having a `vision_model` attribute).
+        obj = self.vlm
+        while not hasattr(obj, "vision_model"):
+            if hasattr(obj, "base_model"):
+                obj = obj.base_model
+            elif hasattr(obj, "model"):
+                obj = obj.model
+            else:
+                break
+        return obj
 
     def set_requires_grad(self):
-        if self.freeze_vision_encoder:
-            self.get_vlm_model().vision_model.eval()
-            for params in self.get_vlm_model().vision_model.parameters():
-                params.requires_grad = False
-        if self.train_expert_only:
+        if self.use_qlora:
+            # Single explicit pass: only train LoRA params that are NOT in the vision encoder.
+            # Everything else (base weights, vision encoder LoRA) stays frozen.
+            for name, params in self.vlm.named_parameters():
+                is_lora = "lora_" in name
+                in_vision = "vision_model" in name
+                params.requires_grad = is_lora and not (self.freeze_vision_encoder and in_vision)
+            if self.freeze_vision_encoder:
+                self.get_vlm_model().vision_model.eval()
+        elif self.train_expert_only:
             self.vlm.eval()
             for params in self.vlm.parameters():
                 params.requires_grad = False
@@ -173,7 +248,7 @@ class SmolVLMWithExpertModel(nn.Module):
         if self.freeze_vision_encoder:
             self.get_vlm_model().vision_model.eval()
 
-        if self.train_expert_only:
+        if self.train_expert_only and not self.use_qlora:
             self.vlm.eval()
 
     def embed_image(self, image: torch.Tensor):
@@ -219,7 +294,7 @@ class SmolVLMWithExpertModel(nn.Module):
             input_shape = hidden_states.shape[:-1]
             hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
 
-            hidden_states = hidden_states.to(dtype=layer.self_attn.q_proj.weight.dtype)
+            hidden_states = hidden_states.to(dtype=get_compute_dtype(layer.self_attn.q_proj))
             query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape)
             key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape)
             value_state = layer.self_attn.v_proj(hidden_states).view(hidden_shape)
@@ -304,7 +379,7 @@ class SmolVLMWithExpertModel(nn.Module):
             input_shape = hidden_states.shape[:-1]
             hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
 
-            hidden_states = hidden_states.to(dtype=layer.self_attn.q_proj.weight.dtype)
+            hidden_states = hidden_states.to(dtype=get_compute_dtype(layer.self_attn.q_proj))
             query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape)
             key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape)
             value_states = layer.self_attn.v_proj(hidden_states).view(hidden_shape)
@@ -345,17 +420,17 @@ class SmolVLMWithExpertModel(nn.Module):
             expert_input_shape = expert_hidden_states.shape[:-1]
             expert_hidden_shape = (*expert_input_shape, -1, expert_layer.self_attn.head_dim)
 
-            expert_hidden_states = expert_hidden_states.to(dtype=expert_layer.self_attn.q_proj.weight.dtype)
+            expert_hidden_states = expert_hidden_states.to(dtype=get_compute_dtype(expert_layer.self_attn.q_proj))
             expert_query_state = expert_layer.self_attn.q_proj(expert_hidden_states).view(expert_hidden_shape)
 
-            _key_states = key_states.to(dtype=expert_layer.self_attn.k_proj.weight.dtype).view(
+            _key_states = key_states.to(dtype=get_compute_dtype(expert_layer.self_attn.k_proj)).view(
                 *key_states.shape[:2], -1
             )
             expert_key_states = expert_layer.self_attn.k_proj(_key_states).view(
                 *_key_states.shape[:-1], -1, expert_layer.self_attn.head_dim
             )  # k_proj should have same dim as kv
 
-            _value_states = value_states.to(dtype=expert_layer.self_attn.v_proj.weight.dtype).view(
+            _value_states = value_states.to(dtype=get_compute_dtype(expert_layer.self_attn.v_proj)).view(
                 *value_states.shape[:2], -1
             )
             expert_value_states = expert_layer.self_attn.v_proj(_value_states).view(
@@ -466,8 +541,9 @@ class SmolVLMWithExpertModel(nn.Module):
                         continue
                     end = start + hidden_states.shape[1]
 
-                    if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
-                        att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
+                    target_dtype = get_compute_dtype(layer.self_attn.o_proj)
+                    if att_output.dtype != target_dtype:
+                        att_output = att_output.to(target_dtype)
                     att_out = att_output[:, start:end]
                     out_emb = layer.self_attn.o_proj(att_out)
 

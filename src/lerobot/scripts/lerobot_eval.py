@@ -516,20 +516,20 @@ def eval_main(cfg: EvalPipelineConfig):
 
     logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
 
-    logging.info("Making environment.")
-    envs = make_env(
-        cfg.env,
-        n_envs=cfg.eval.batch_size,
-        use_async_envs=cfg.eval.use_async_envs,
-        trust_remote_code=cfg.trust_remote_code,
-    )
-
     logging.info("Making policy.")
 
     policy = make_policy(
         cfg=cfg.policy,
         env_cfg=cfg.env,
         rename_map=cfg.rename_map,
+    )
+
+    logging.info("Making environment.")
+    envs = make_env(
+        cfg.env,
+        n_envs=cfg.eval.batch_size,
+        use_async_envs=cfg.eval.use_async_envs,
+        trust_remote_code=cfg.trust_remote_code,
     )
 
     policy.eval()

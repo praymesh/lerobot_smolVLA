@@ -267,6 +267,66 @@ class SmolVLAPolicy(PreTrainedPolicy):
             if model_value is not None:
                 model_value.rtc_processor = self.rtc_processor
 
+    @classmethod
+    def from_pretrained(cls, pretrained_name_or_path, *, config=None, strict=False, **kwargs):
+        """Override to skip policy.to(device) after loading — BnB QLoRA models use device_map='auto'
+        and are already on GPU; calling .to() again causes OOM."""
+        import os
+        from lerobot.policies.pretrained import PreTrainedConfig
+        from huggingface_hub import hf_hub_download
+        from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
+        from huggingface_hub.errors import HfHubHTTPError
+
+        if config is None:
+            config = PreTrainedConfig.from_pretrained(
+                pretrained_name_or_path=pretrained_name_or_path, **kwargs
+            )
+        model_id = str(pretrained_name_or_path)
+        instance = cls(config, **kwargs)
+        if os.path.isdir(model_id):
+            print("Loading weights from local directory")
+            model_file = os.path.join(model_id, SAFETENSORS_SINGLE_FILE)
+            policy = cls._load_as_safetensor(instance, model_file, config.device, strict)
+        else:
+            try:
+                model_file = hf_hub_download(repo_id=model_id, filename=SAFETENSORS_SINGLE_FILE)
+                policy = cls._load_as_safetensor(instance, model_file, config.device, strict)
+            except HfHubHTTPError as e:
+                raise FileNotFoundError(
+                    f"{SAFETENSORS_SINGLE_FILE} not found on the HuggingFace Hub in {model_id}"
+                ) from e
+
+        # Skip policy.to(config.device) — QLoRA models use device_map="auto" and are
+        # already placed correctly. Calling .to() would OOM on a 4GB GPU.
+        policy.eval()
+        return policy
+
+    @classmethod
+    def _load_as_safetensor(cls, model, model_file, map_location, strict):
+        """Load weights to CPU first to avoid double-GPU OOM when VLM uses device_map='auto'."""
+        from safetensors.torch import load_model as load_model_as_safetensor
+        from lerobot.policies.utils import log_model_loading_keys
+
+        # Always load to CPU first — the model's parameters are already on the correct
+        # device (GPU via device_map="auto" for QLoRA, or CPU for non-QLoRA). PyTorch's
+        # in-place copy_ will move the loaded tensor to wherever the parameter lives.
+        missing_keys, unexpected_keys = load_model_as_safetensor(
+            model, model_file, strict=strict, device="cpu"
+        )
+        log_model_loading_keys(missing_keys, unexpected_keys)
+        return model
+
+    def to(self, *args, **kwargs):
+        """Skip .to(device) if VLM is already on GPU via device_map='auto' (QLoRA case).
+        Calling .to() on a BnB 4-bit model causes OOM by duplicating GPU tensors."""
+        try:
+            vlm_device = next(self.model.vlm_with_expert.vlm.parameters()).device
+            if vlm_device.type == "cuda":
+                return self
+        except StopIteration:
+            pass
+        return super().to(*args, **kwargs)
+
     def get_optim_params(self) -> dict:
         return self.parameters()
 
@@ -568,19 +628,28 @@ class VLAFlowMatching(nn.Module):
             self_attn_every_n_layers=self.config.self_attn_every_n_layers,
             expert_width_multiplier=self.config.expert_width_multiplier,
             device=self.config.device if self.config.device is not None else "auto",
+            use_qlora=self.config.use_qlora,
+            lora_r=self.config.lora_r,
+            lora_alpha=self.config.lora_alpha,
+            lora_dropout=self.config.lora_dropout,
+            lora_target_modules=self.config.lora_target_modules,
         )
+        # Resolve the device the VLM landed on (device_map="auto" may place it on GPU).
+        # All projection layers must be on the same device.
+        _vlm_device = next(self.vlm_with_expert.get_vlm_model().parameters()).device
+
         self.state_proj = nn.Linear(
             self.config.max_state_dim, self.vlm_with_expert.config.text_config.hidden_size
-        )
-        self.action_in_proj = nn.Linear(self.config.max_action_dim, self.vlm_with_expert.expert_hidden_size)
-        self.action_out_proj = nn.Linear(self.vlm_with_expert.expert_hidden_size, self.config.max_action_dim)
+        ).to(_vlm_device)
+        self.action_in_proj = nn.Linear(self.config.max_action_dim, self.vlm_with_expert.expert_hidden_size).to(_vlm_device)
+        self.action_out_proj = nn.Linear(self.vlm_with_expert.expert_hidden_size, self.config.max_action_dim).to(_vlm_device)
 
         self.action_time_mlp_in = nn.Linear(
             self.vlm_with_expert.expert_hidden_size * 2, self.vlm_with_expert.expert_hidden_size
-        )
+        ).to(_vlm_device)
         self.action_time_mlp_out = nn.Linear(
             self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size
-        )
+        ).to(_vlm_device)
 
         self.set_requires_grad()
         self.fake_image_token = self.vlm_with_expert.processor.tokenizer.fake_image_token_id

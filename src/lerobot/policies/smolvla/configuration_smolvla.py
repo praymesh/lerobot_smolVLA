@@ -84,7 +84,7 @@ class SmolVLAConfig(PreTrainedConfig):
     scheduler_decay_steps: int = 30_000
     scheduler_decay_lr: float = 2.5e-6
 
-    vlm_model_name: str = "HuggingFaceTB/SmolVLM2-236M-Video-Instruct"  # Select the VLM backbone.
+    vlm_model_name: str = "microsoft/florence-2-base"  # Select the VLM backbone.
     #vlm_model_name: str = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"  # Select the VLM backbone.
     load_vlm_weights: bool = False  # Set to False in case of training the expert from scratch. True when init from pretrained SmolVLA weights
 
@@ -110,10 +110,24 @@ class SmolVLAConfig(PreTrainedConfig):
     compile_model: bool = False  # Whether to use torch.compile for model optimization
     compile_mode: str = "max-autotune"  # Torch compile mode
 
+    # QLoRA: 4-bit VLM + LoRA adapters. Reduces VLM memory ~4x and improves accuracy
+    # by allowing the VLM text model to adapt to the robot domain (vs fully frozen).
+    # Requires: pip install bitsandbytes peft
+    use_qlora: bool = False
+    lora_r: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.05
+    lora_target_modules: list[str] = field(default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj", "proj"])  # full attention + vision-text connector
+
     def __post_init__(self):
         super().__post_init__()
 
         """Input validation (not exhaustive)."""
+        if self.use_qlora and self.train_expert_only:
+            raise ValueError(
+                "use_qlora=True requires train_expert_only=False so that LoRA parameters "
+                "in the VLM text model are included in training. Set train_expert_only=False."
+            )
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "

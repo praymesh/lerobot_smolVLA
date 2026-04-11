@@ -1,0 +1,12 @@
+# Base LeRobot + SmolVLA
+# Install first with: pip install -e ".[smolvla]"
+
+# Florence-2 vision backbone (loads via trust_remote_code — pulls DaViT + deps automatically)
+# timm is required by Florence-2's DaViT vision tower
+timm>=1.0.0
+
+# Fast HuggingFace downloads (avoids Xet protocol hangs on large checkpoints)
+hf-transfer>=0.1.9
+
+# Loss curve / result plotting
+matplotlib>=3.10.0

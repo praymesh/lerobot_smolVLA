@@ -5,7 +5,7 @@ import os
 sys.path.insert(0, os.path.abspath("src"))
 
 # ==============================================================================
-# 1. PATCH FACTORY
+# PATCHES APPLIED
 #
 # Two modes depending on whether a LoRA adapter checkpoint exists at
 # pretrained_path:
@@ -50,9 +50,7 @@ def custom_make_policy(cfg, ds_meta=None, env_cfg=None, rename_map=None):
             adapter_config_path = candidate
 
     if adapter_config_path is not None:
-        # ------------------------------------------------------------------
         # EVAL: load saved LoRA adapter weights
-        # ------------------------------------------------------------------
         from peft import PeftModel
         print(f"\n>>> [EVAL] Loading LoRA adapters from: {original_pretrained_path} <<<\n")
         policy = PeftModel.from_pretrained(
@@ -61,9 +59,7 @@ def custom_make_policy(cfg, ds_meta=None, env_cfg=None, rename_map=None):
             is_trainable=False,
         )
     else:
-        # ------------------------------------------------------------------
         # TRAINING: apply a fresh LoRA with the requested rank
-        # ------------------------------------------------------------------
         from peft import LoraConfig, get_peft_model
 
         common_projections = (
@@ -98,9 +94,7 @@ def custom_make_policy(cfg, ds_meta=None, env_cfg=None, rename_map=None):
 factory.make_policy = custom_make_policy
 
 
-# ==============================================================================
-# 2. PATCH DATASET  (fixes missing camera stats key on first load)
-# ==============================================================================
+# PATCH DATASET  (fixes missing camera stats key on first load)
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 original_init = LeRobotDataset.__init__
 
@@ -114,17 +108,13 @@ def patched_init(self, *args, **kwargs):
 LeRobotDataset.__init__ = patched_init
 
 
-# ==============================================================================
 # 3. IMPORT TRAINER
-# ==============================================================================
 try:
     from lerobot.scripts.lerobot_train import main as train_cli
 except ImportError:
     from lerobot.scripts.train import main as train_cli
 
 
-# ==============================================================================
-# 4. RUN
-# ==============================================================================
+# RUN
 if __name__ == "__main__":
     train_cli()

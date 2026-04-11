@@ -17,7 +17,7 @@ BATCH_SIZE=2
 SAVE_FREQ=4000   # checkpoint every 4k steps -> 10 checkpoints total
 LOG_FREQ=100     # log every 100 steps -> 400 loss points for clean curves
 
-# Fixed configuration: rank 32, 50 demos
+# configuration: rank 32, 50 demos
 R=32
 DEMO_COUNT=50
 
@@ -27,12 +27,10 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 JOB_NAME="aloha_r${R}_d${DEMO_COUNT}_${TIMESTAMP}"
 OUT_DIR="outputs/train/${JOB_NAME}"
 
-echo "=========================================================="
 echo "LAUNCHING TRAINING | Job: $JOB_NAME | Rank: $R | Demos: $DEMO_COUNT"
 echo "Dataset: $DATASET"
 echo "Steps: $STEPS | Save every: $SAVE_FREQ | Log every: $LOG_FREQ"
 echo "Output: $OUT_DIR"
-echo "=========================================================="
 
 export LORA_RANK=$R
 

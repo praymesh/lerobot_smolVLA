@@ -176,19 +176,21 @@ N_COLOR_CHANNELS = 3
 @dataclass
 class GR00TN15Config(PretrainedConfig):
     model_type = "gr00t_n1_5"
-    backbone_cfg: dict = field(init=False, metadata={"help": "Backbone configuration."})
+    backbone_cfg: dict = None
+    action_head_cfg: dict = None
 
-    action_head_cfg: dict = field(init=False, metadata={"help": "Action head configuration."})
+    action_horizon: int = None
 
-    action_horizon: int = field(init=False, metadata={"help": "Action horizon."})
+    action_dim: int = 7
+    compute_dtype: str = "float32"
 
-    action_dim: int = field(init=False, metadata={"help": "Action dimension."})
-    compute_dtype: str = field(default="float32", metadata={"help": "Compute dtype."})
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        for key, value in kwargs.items():
-            setattr(self, key, value)
+    def _init_(self, **kwargs):
+        self.backbone_cfg = kwargs.pop("backbone_cfg", {})
+        self.action_head_cfg = kwargs.pop("action_head_cfg", {})
+        self.action_horizon = kwargs.pop("action_horizon", 1)
+        self.action_dim = kwargs.pop("action_dim", 7)
+        self.compute_dtype = kwargs.pop("compute_dtype", "float32")
+        super()._init_(**kwargs)
 
 
 # real model

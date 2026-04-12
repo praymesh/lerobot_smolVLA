@@ -1,0 +1,14 @@
+# Base LeRobot + SmolVLA
+# Install first with: pip install -e ".[smolvla]"
+
+# 4-bit quantization (BitsAndBytes NF4 QLoRA)
+bitsandbytes>=0.43.0
+
+# LoRA adapters (PEFT)
+peft>=0.18.1
+
+# Fast HuggingFace downloads (avoids Xet protocol hangs)
+hf-transfer>=0.1.9
+
+# Loss curve / result plotting
+matplotlib>=3.10.0
